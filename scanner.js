@@ -22,15 +22,15 @@
 
 var SHEET_NAME  = "Sales";
 var SPREAD_NAME = "Sole Ledger Sales";
-var DAYS_BACK   = 30;
+var DAYS_BACK   = 90;
 var COLS = ["id","date","platform","brand","model","colorway","sku","size","salePrice","cost","notes","emailSubject","emailDate","raw"];
 
 // ── Web App endpoint — called by Sole Ledger app ───────────────
 function doGet(e) {
-  var callback = e && e.parameter && e.parameter.callback;
-  var result;
   try {
+    // Run a fresh scan first
     scanEmails();
+    // Return all sales as JSON
     var ss    = getOrCreateSheet();
     var sheet = ss.getSheetByName(SHEET_NAME);
     var last  = sheet.getLastRow();
@@ -43,20 +43,14 @@ function doGet(e) {
         if (obj.id) sales.push(obj);
       });
     }
-    result = { ok: true, sales: sales, count: sales.length };
-  } catch(err) {
-    result = { ok: false, error: err.message };
-  }
-  var json = JSON.stringify(result);
-  // JSONP: wrap in callback if provided (needed for Safari file:// pages)
-  if (callback) {
     return ContentService
-      .createTextOutput(callback + "(" + json + ");")
-      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+      .createTextOutput(JSON.stringify({ ok: true, sales: sales, count: sales.length }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: false, error: err.message }))
+      .setMimeType(ContentService.MimeType.JSON);
   }
-  return ContentService
-    .createTextOutput(json)
-    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // ── Entry point (runs every 15 min via trigger) ────────────────
@@ -71,7 +65,6 @@ function scanEmails() {
   results = results.concat(scanGOAT(cutoff, existing));
   results = results.concat(scanEbay(cutoff, existing));
   results = results.concat(scanDepop(cutoff, existing));
-  results = results.concat(scanAlias(cutoff, existing));
   results = results.concat(scanGeneric(cutoff, existing));
 
   if (results.length > 0) {
@@ -90,11 +83,11 @@ function scanEmails() {
   meta.getRange("B2").setValue(sheet.getLastRow() - 1);
 }
 
-// ── StockX ───────────────────────────────────────────────────────────────
+// ── StockX ─────────────────────────────────────────────────────
 function scanStockX(cutoff, existing) {
   var results = [];
   var threads = GmailApp.search(
-    'from:noreply@stockx.com subject:"You Sold Your Item" after:' + dateStr(cutoff),
+    'from:(noreply@stockx.com OR orders@stockx.com) subject:("Your sale" OR "sold" OR "Sale confirmed") after:' + dateStr(cutoff),
     0, 50
   );
   threads.forEach(function(thread) {
@@ -104,56 +97,20 @@ function scanStockX(cutoff, existing) {
       if (existing[id]) return;
       var body = msg.getPlainBody();
       var subj = msg.getSubject();
-
-      // Shoe name from subject: "You Sold Your Item! Nike Blazer Mid 77..."
-      var shoeName = subj
-        .replace(/^[^a-zA-Z0-9]*/,"")
-        .replace(/you sold your item[!.]*/i,"")
-        .replace(/^\s*[!.]\s*/,"")
-        .trim();
-
-      // Sale Price: "Sale Price: $65.00"
-      var salePrice = null;
-      var spM = body.match(/sale price[\s\S]{0,5}\$([ \d,]+\.\d{2})/i);
-      if (spM) salePrice = parseFloat(spM[1].replace(/[, ]/g,""));
-
-      // Total Payout: "TOTAL PAYOUT $52.53"
-      var payout = null;
-      var pyM = body.match(/total payout[\s\S]{0,5}\$([ \d,]+\.\d{2})/i);
-      if (pyM) payout = parseFloat(pyM[1].replace(/[, ]/g,""));
-
-      // Size: "Size: US W 8" or "Size: US 10.5"
-      var sizeM = body.match(/size:\s*us\s*(?:w\s*|m\s*)?([0-9]+\.?[0-9]*)/i);
-      var size = sizeM ? parseFloat(sizeM[1]) : "";
-
-      // Style ID: "Style ID: 568497C"
-      var skuM = body.match(/style id:\s*([A-Za-z0-9\-]+)/i);
-      var sku = skuM ? skuM[1].trim() : "";
-
-      // Order number: "Order number: 04-DHD7X21J3V"
-      var orderM = body.match(/order number:\s*([A-Za-z0-9\-]+)/i);
-      var orderId = orderM ? orderM[1].trim() : "";
-
-      // Fee breakdown
-      var txnM  = body.match(/transaction fee[^\n\$]*\$([ \d,]+\.\d{2})/i);
-      var procM = body.match(/payment proc[^\n\$]*\$([ \d,]+\.\d{2})/i);
-      var shipM = body.match(/shipping:[^\n\$]*\$([ \d,]+\.\d{2})/i);
-      var notesParts = [];
-      if (orderId) notesParts.push("Order: " + orderId);
-      if (txnM)    notesParts.push("TxnFee: $" + txnM[1].trim());
-      if (procM)   notesParts.push("ProcFee: $" + procM[1].trim());
-      if (shipM)   notesParts.push("Shipping: $" + shipM[1].trim());
-      if (payout)  notesParts.push("Payout: $" + payout);
-
-      if (!shoeName && !salePrice) return;
-      var parsed = parseShoe(shoeName);
-      results.push({
-        id: id, date: fmtDate(msg.getDate()), platform: "StockX",
-        brand: parsed.brand, model: parsed.model, colorway: parsed.colorway,
-        sku: sku, size: size, salePrice: salePrice || payout, cost: "",
-        notes: notesParts.join(" | "),
-        emailSubject: subj, emailDate: msg.getDate().toISOString(), raw: body.substring(0, 800)
-      });
+      var price = extractPrice(body, [
+        /sale\s+price[\s\S]{0,40}?\$\s*([\d,]+\.?\d*)/i,
+        /you\s+sold\s+for\s+\$\s*([\d,]+\.?\d*)/i,
+        /payout[\s\S]{0,30}?\$\s*([\d,]+\.?\d*)/i,
+      ]);
+      var shoe = extractShoe(body, subj, [
+        /congratulations[^!]*!\s*([\w].*?)\s*(?:in size|\n|has sold)/i,
+        /you\s+sold\s+(?:a\s+)?([\w].*?)\s+(?:in size|\()/i,
+        /item[:\s]+([\w].*?)\n/i
+      ]);
+      var size = extractSize(body, [/size\s*:?\s*([0-9]+\.?[0-9]*)/i, /in\s+size\s+([0-9]+\.?[0-9]*)/i]);
+      if (!price && !shoe) return;
+      var parsed = parseShoe(shoe);
+      results.push({ id:id, date:fmtDate(msg.getDate()), platform:"StockX", brand:parsed.brand, model:parsed.model, colorway:parsed.colorway, sku:"", size:size, salePrice:price, cost:"", notes:"", emailSubject:subj, emailDate:msg.getDate().toISOString(), raw:body.substring(0,500) });
     });
   });
   return results;
@@ -235,67 +192,6 @@ function scanDepop(cutoff, existing) {
   return results;
 }
 
-// ── Alias ──────────────────────────────────────────────────────
-function scanAlias(cutoff, existing) {
-  var results = [];
-  var threads = GmailApp.search(
-    'from:info@alias.org after:' + dateStr(cutoff),
-    0, 50
-  );
-  threads.forEach(function(thread) {
-    thread.getMessages().forEach(function(msg) {
-      if (msg.getDate() < cutoff) return;
-      var id = "alias_" + msg.getId();
-      if (existing[id]) return;
-      var body = msg.getPlainBody();
-      var subj = msg.getSubject();
-
-      // Sale price
-      var salePrice = null;
-      var spM = body.match(/sale price[\s:]+\$?([\d,]+\.?\d*)/i) ||
-                body.match(/selling price[\s:]+\$?([\d,]+\.?\d*)/i) ||
-                body.match(/\$\s*([\d,]+\.\d{2})/);
-      if (spM) salePrice = parseFloat(spM[1].replace(/,/g,""));
-
-      // Payout
-      var payout = null;
-      var pyM = body.match(/(?:total\s+)?payout[\s:]+\$?([\d,]+\.?\d*)/i) ||
-                body.match(/you(?:\s+will)?\s+receive[\s:]+\$?([\d,]+\.?\d*)/i);
-      if (pyM) payout = parseFloat(pyM[1].replace(/,/g,""));
-
-      // Shoe name — try subject first
-      var shoeName = subj.replace(/^[^a-zA-Z0-9]*/,"").trim();
-
-      // Size
-      var sizeM = body.match(/size[\s:]+(?:us\s*)?([0-9]+\.?[0-9]*)/i);
-      var size = sizeM ? parseFloat(sizeM[1]) : "";
-
-      // SKU / style
-      var skuM = body.match(/(?:style|sku|article)[\s:]+([A-Za-z0-9\-]+)/i);
-      var sku = skuM ? skuM[1].trim() : "";
-
-      // Order number
-      var orderM = body.match(/order(?:\s+(?:id|number|#))?[\s:]+([A-Za-z0-9\-]+)/i);
-      var orderId = orderM ? orderM[1].trim() : "";
-
-      var notesParts = [];
-      if (orderId) notesParts.push("Order: " + orderId);
-      if (payout)  notesParts.push("Payout: $" + payout);
-
-      if (!salePrice && !payout && !shoeName) return;
-      var parsed = parseShoe(shoeName);
-      results.push({
-        id: id, date: fmtDate(msg.getDate()), platform: "Alias",
-        brand: parsed.brand, model: parsed.model, colorway: parsed.colorway,
-        sku: sku, size: size, salePrice: salePrice || payout, cost: "",
-        notes: notesParts.join(" | "),
-        emailSubject: subj, emailDate: msg.getDate().toISOString(), raw: body.substring(0, 800)
-      });
-    });
-  });
-  return results;
-}
-
 // ── Generic ────────────────────────────────────────────────────
 function scanGeneric(cutoff, existing) {
   var results = [];
@@ -356,7 +252,12 @@ function guessFromDomain(from) {
 function fmtDate(d) { return Utilities.formatDate(d,Session.getScriptTimeZone(),"yyyy-MM-dd"); }
 function dateStr(d) { return Utilities.formatDate(d,Session.getScriptTimeZone(),"yyyy/MM/dd"); }
 function getCutoffDate(sheet) {
-  // Always scan the last DAYS_BACK days — existing IDs prevent duplicates
+  var last=sheet.getLastRow();
+  if (last>1) {
+    var dateCol=COLS.indexOf("emailDate")+1;
+    var dates=sheet.getRange(2,dateCol,last-1,1).getValues().flat().filter(Boolean);
+    if (dates.length>0) { return dates.map(function(d){return new Date(d);}).sort(function(a,b){return b-a;})[0]; }
+  }
   var d=new Date(); d.setDate(d.getDate()-DAYS_BACK); return d;
 }
 function getExistingIds(sheet) {
@@ -389,7 +290,7 @@ function rescan() {
   var ss=getOrCreateSheet(); var sheet=ss.getSheetByName(SHEET_NAME);
   if(sheet.getLastRow()>1) sheet.getRange(2,1,sheet.getLastRow()-1,COLS.length).clearContent();
   var d=new Date(); d.setDate(d.getDate()-DAYS_BACK);
-  var results=[].concat(scanStockX(d,{}),scanGOAT(d,{}),scanEbay(d,{}),scanDepop(d,{}),scanAlias(d,{}));
+  var results=[].concat(scanStockX(d,{}),scanGOAT(d,{}),scanEbay(d,{}),scanDepop(d,{}));
   results.forEach(function(row){sheet.appendRow(COLS.map(function(c){return row[c]||"";}));});
   Logger.log("Rescan complete. Found "+results.length+" sales.");
 }
