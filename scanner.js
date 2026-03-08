@@ -274,8 +274,8 @@ function scanAlias(cutoff, existing) {
       var sizeM = body.match(/^Size:\s*([0-9]+\.?[0-9]*)/im);
       var size = sizeM ? parseFloat(sizeM[1]) : "";
 
-      // SKU: "SKU: DD8959 100"
-      var skuM = body.match(/^SKU:\s*([A-Za-z0-9\s\-]+)/im);
+      // SKU: "SKU: DD8959 100" — capture only alphanumeric/spaces/dashes on that line
+      var skuM = body.match(/^SKU:\s*([^\n\r]+)/im);
       var sku = skuM ? skuM[1].trim() : "";
 
       // Order #: "Order #: 961544002"
